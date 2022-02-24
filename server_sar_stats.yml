@@ -1,0 +1,119 @@
+# Must have a newer Jina2 (>=2.8) installed
+# https://stackoverflow.com/questions/49040013/how-can-i-know-what-version-of-jinja2-my-ansible-is-using
+# pip install --user --upgrade jinja2
+---
+- hosts: all
+  gather_facts: true
+  tasks:
+    - name: Identify relevant await (combined latency) measurements for all devices
+      set_fact:
+        await_net_measurements: "{{ ansible_local.sarcery.averages.keys() | map('regex_search', '^(.*::await)$') | reject('none') | sort | list }}"
+        # assume maximums and averages have the same exact counters
+
+    - name: Extract await (combined latency) statistics from sar output
+      set_fact:
+        local_devicelatency_averages: "{{ await_net_measurements | map('extract', ansible_local.sarcery.averages) | list }}"
+
+    - name: Identify relevant network measurements, both read and write, for all devices
+      set_fact:
+        tx_net_measurements: "{{ ansible_local.sarcery.averages.keys() | map('regex_search', '^(.*::txkB/s)$') | reject('none') | sort | list }}"
+        rx_net_measurements: "{{ ansible_local.sarcery.averages.keys() | map('regex_search', '^(.*::rxkB/s)$') | reject('none') | sort | list }}"
+        # assume maximums and averages have the same exact counters
+    
+    - name: Exclude the lo (loopback) network interface from consideration
+      set_fact:
+        tx_ext_net_measurements: "{{ tx_net_measurements | map('regex_replace', '^lo::.*$', '') | reject('eq', '') | list }}"
+        rx_ext_net_measurements: "{{ rx_net_measurements | map('regex_replace', '^lo::.*$', '') | reject('eq', '') | list }}"
+
+    - name: Extract network I/O averages and maximums (kB/s), both read and write, for all interfaces
+      set_fact:
+        tx_net_average_throughputs: "{{ tx_ext_net_measurements | map('extract', ansible_local.sarcery.averages) | map('float') | list }}"
+        tx_net_maximum_throughputs: "{{ tx_ext_net_measurements | map('extract', ansible_local.sarcery.maximums) | map(attribute='measurement') | map('float') | list }}"
+        rx_net_average_throughputs: "{{ rx_ext_net_measurements | map('extract', ansible_local.sarcery.averages) | map('float') | list }}"
+        rx_net_maximum_throughputs: "{{ rx_ext_net_measurements | map('extract', ansible_local.sarcery.maximums) | map(attribute='measurement') | map('float') | list }}"
+
+    - name: Aggregate read/write network I/O into total values, for all interfaces
+      set_fact:
+        net_average_throughputs: "{{ tx_net_average_throughputs | zip(rx_net_average_throughputs) | map('sum') | list }}"
+        # TODO: net_maximum_throughputs is not perfect, and will underestimate the peak network traffic by some amount.
+        # A real measurement would sum the rx+tx *at every sample* and then take the maximum at the end.
+        # A non-conservative fake estimate would sum max(rx)+max(tx) at an artifical time sample.
+        # This conservative (but still fake) estimate considers only max(max(rx),max(tx)).
+        net_maximum_throughputs: "{{ tx_net_maximum_throughputs | zip(rx_net_maximum_throughputs) | map('max') | list }}"
+
+    - name: Calculate "Avg Read IO" (# iops)
+      set_fact:
+        avg_read_io: "{{ ansible_local.sarcery.averages.rtps }}"
+
+    - name: Calculate "Peak Read IO" (# iops)
+      set_fact:
+        peak_read_io: "{{ ansible_local.sarcery.maximums.rtps.measurement }}"
+
+    - name: Calculate "Avg Write IO" (# iops)
+      set_fact:
+        avg_write_io: "{{ ansible_local.sarcery.averages.wtps }}"
+
+    - name: Calculate "Peak Write IO" (# iops)
+      set_fact:
+        peak_write_io: "{{ ansible_local.sarcery.maximums.wtps.measurement }}"
+
+    - name: Calculate "Avg Combined Lat" (milliseconds)
+      set_fact:
+        avg_combined_lat: "{{ (local_devicelatency_averages|map('float')|sum) / (local_devicelatency_averages|length) }}"
+
+    - name: Calculate "Avg Network IO" (kilobits/s, converted from kB/s)
+      set_fact:
+        avg_network_io: "{{ ((net_average_throughputs|map('float')|sum) / (net_average_throughputs|length)) * 8 }}"
+
+    - name: Calculate "Peak Network IO" (kilobits/s, converted from kB/s)
+      set_fact:
+        peak_network_io: "{{ (net_maximum_throughputs|map('float')|max) * 8 }}"
+
+    - name: Calculate "Avg CPU Load" (%)
+      set_fact:
+        avg_cpu_load: "{{ 100 - ansible_local.sarcery.averages['all::%idle'] }}"
+
+    - name: Calculate "Peak CPU Load" (%)
+      set_fact:
+        peak_cpu_load: "{{ 100 - ansible_local.sarcery.minimums['all::%idle'].measurement }}"
+
+    - name: Calculate "Avg Memory Commit" (kB)
+      set_fact:
+        avg_memory_commit: "{{ ansible_local.sarcery.averages.kbcommit }}"
+
+    - name: Calculate "Peak Memory Commit" (kB)
+      set_fact:
+        peak_memory_commit: "{{ ansible_local.sarcery.maximums.kbcommit.measurement }}"
+
+    - name: Calculate "Total Physical Memory" (kB)
+      set_fact:
+        total_physical_memory: "{{ facter_memory.system.total_bytes / 1024 }}"
+
+    - name: Create a temporary file to store calculated data
+      tempfile:
+        prefix: sarcery
+      register: tempfile_calculated
+
+    - name: Write headers to temporary file
+      lineinfile:
+        path: "{{ tempfile_calculated.path }}"
+        line: '"Avg Read IO","Peak Read IO","Avg Write IO","Peak Write IO","Avg Combined Lat","Avg Network IO","Peak Network IO","Avg CPU Load","Peak CPU Load","Avg Memory Commit","Peak Memory Commit","Total Physical Memory"'
+        insertafter: EOF
+
+    - name: Write calculated data to temporary file
+      lineinfile:
+        path: "{{ tempfile_calculated.path }}"
+        line: "{{avg_read_io}},{{peak_read_io}},{{avg_write_io}},{{peak_write_io}},{{avg_combined_lat}},{{avg_network_io}},{{peak_network_io}},{{avg_cpu_load}},{{peak_cpu_load}},{{avg_memory_commit}},{{peak_memory_commit}},{{total_physical_memory}}"
+        insertafter: EOF
+
+    - name: Pull calculated data to control node for analysis
+      fetch:
+        src: "{{ tempfile_calculated.path }}"
+        dest: /tmp/sarcery
+        flat: no
+
+    - name: Remove the temporary file
+      file:
+        path: "{{ tempfile_calculated.path }}"
+        state: absent
+      when: tempfile_calculated.path is defined
