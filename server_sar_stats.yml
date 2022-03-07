@@ -87,7 +87,7 @@
 
     - name: Calculate "Total Physical Memory" (kB)
       set_fact:
-        total_physical_memory: "{{ facter_memory.system.total_bytes / 1024 }}"
+        total_physical_memory: "{{ ansible_memtotal_mb * 1024 }}"
 
     - name: Create a temporary file to store calculated data
       tempfile:
